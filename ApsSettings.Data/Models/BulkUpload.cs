@@ -19,8 +19,8 @@ namespace ApsSettings.Data.Models
             get
             {
                 return ExcludedFolderNames
-                    .Split(",")
-                    .Select(x => x.Trim().ToLower())
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(x => x.ToLower())
                     .ToList();
             }
         }
@@ -33,8 +33,8 @@ namespace ApsSettings.Data.Models
             get
             {
                 return ExcludedFileTypes
-                    .Split(",")
-                    .Select(x => x.Trim().ToLower())
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(x => x.ToLower())
                     .ToList();
             }
         }
@@ -56,6 +56,8 @@ namespace ApsSettings.Data.Models
         [NotMapped] public long PendingFileCount { get; set; }
         [NotMapped] public long SuccessFileCount { get; set; }
         [NotMapped] public long FailedFileCount { get; set; }
+        [NotMapped] public long TotalBytes { get; set; }
+        [NotMapped] public long UploadedBytes { get; set; }
 
         public void AddLogs(string log)
         {

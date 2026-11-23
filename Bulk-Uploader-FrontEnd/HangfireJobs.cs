@@ -6,6 +6,7 @@ using Hangfire;
 using Microsoft.EntityFrameworkCore;
 using RestSharp;
 using Serilog;
+using System.Collections.Concurrent;
 using System.Net;
 using Ac.Net.Authentication;
 using Bulk_Uploader_Electron.Helpers;
@@ -14,81 +15,96 @@ using System.Text.RegularExpressions;
 
 namespace mass_upload_via_s3_csharp;
 
-public class FileDTU
+public class FileDTU : IEquatable<FileDTU>
 {
-    public bool Equals(FileDTU file)
+    public bool Equals(FileDTU? file)
     {
-        if (file == null)
+        if (file is null)
             return false;
 
-        if (this.Name == file.Name && this.ParentFolderUrn == file.ParentFolderUrn &&
-            this.ParentFolderUrn == file.ParentFolderUrn && this.ItemId == file.ItemId)
-            return true;
-        else
-            return false;
+        return Name == file.Name
+            && ParentFolderUrn == file.ParentFolderUrn
+            && ItemId == file.ItemId;
     }
 
-    public override bool Equals(Object obj)
+    public override bool Equals(object? obj)
     {
-        if (obj == null)
-            return false;
-
-        FileDTU personObj = obj as FileDTU;
-        if (personObj == null)
-            return false;
-        else
-            return Equals(personObj);
+        return obj is FileDTU other && Equals(other);
     }
 
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(Name, ParentFolderUrn, ItemId);
+    }
 
-    public string ProjectId { get; set; }
-    public string ParentFolderUrn { get; set; }
-    public string LocalParentPath { get; set; }
-    public string Name { get; set; }
-    public string ObjectId { get; set; }
-    public string ItemId { get; set; }
-    public string UploadKey { get; set; }
+    public string ProjectId { get; set; } = string.Empty;
+    public string ParentFolderUrn { get; set; } = string.Empty;
+    public string LocalParentPath { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string ObjectId { get; set; } = string.Empty;
+    public string ItemId { get; set; } = string.Empty;
+    public string UploadKey { get; set; } = string.Empty;
 }
 
 public class HangfireJobs
 {
-    public readonly DataContext _context;
+    private const long UploadChunkSize = 20L * 1024 * 1024;
+    private const int MaxUploadAttempts = 5;
+    private const int MaxUploadUrlBatchSize = 25;
+
+    private static readonly ConcurrentDictionary<int, byte> LocalCrawlStarted = new();
+
+    private readonly DataContext _context;
 
     public HangfireJobs(DataContext dataContext)
     {
-        _context = dataContext;
+        _context = dataContext ?? throw new ArgumentNullException(nameof(dataContext));
     }
 
-    private static DateTime lastActivityTime = DateTime.Now;
-    private static int fileNo = 1;
-    private static List<FileDTU> filesProcessed = new List<FileDTU>();
-
     [Queue("build-autodesk-mirror")]
-    public async Task<List<BulkUploadAutodeskMirror>> RetrieveNewMirrorFolders(int bulkUploadId, int mirrorFolderId)
+    public async Task<List<BulkUploadAutodeskMirror>> RetrieveNewMirrorFolders(
+        int bulkUploadId,
+        int mirrorFolderId)
     {
-        var bulkUpload = await _context.BulkUploads.FirstOrDefaultAsync(x => x.Id == bulkUploadId);
-        var bulkUploadMirror =
-            await _context.BulkUploadAutodeskMirrors.FirstOrDefaultAsync(x => x.Id == mirrorFolderId);
+        var bulkUpload = await _context.BulkUploads
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadId);
+
+        var bulkUploadMirror = await _context.BulkUploadAutodeskMirrors
+            .FirstOrDefaultAsync(x => x.Id == mirrorFolderId);
+
+        if (bulkUpload == null || bulkUploadMirror == null)
+        {
+            Log.Warning(
+                "Unable to retrieve Autodesk mirror folders. Bulk upload ID: {BulkUploadId}, mirror ID: {MirrorId}",
+                bulkUploadId,
+                mirrorFolderId);
+
+            return new List<BulkUploadAutodeskMirror>();
+        }
 
         var token = await JointTokenManager.GetToken();
-        // var token = await ThreeLeggedMananger.Instance.GetToken();
-        var (folders, files) =
-            await APSHelpers.GetFolderContents(token, bulkUpload.ProjectId, bulkUploadMirror.FolderUrn);
+
+        var (folders, files) = await APSHelpers.GetFolderContents(
+            token,
+            bulkUpload.ProjectId,
+            bulkUploadMirror.FolderUrn);
 
         var returnFolders = new List<BulkUploadAutodeskMirror>();
+
         if (files.Count > 0)
         {
             var newBulkUploadMirrorFiles = files
-                .Select(file => new BulkUploadAutodeskMirrorFile()
+                .Select(file => new BulkUploadAutodeskMirrorFile
                 {
                     FolderUrn = bulkUploadMirror.FolderUrn,
-                    Name = file.Name.ToLower(),
+                    Name = file.Name.ToLowerInvariant(),
                     ItemId = file.ItemId,
                     BulkUploadId = bulkUpload.Id
                 })
                 .ToList();
 
-            await _context.BulkUploadAutodeskMirrorFiles.AddRangeAsync(newBulkUploadMirrorFiles);
+            await _context.BulkUploadAutodeskMirrorFiles
+                .AddRangeAsync(newBulkUploadMirrorFiles);
         }
 
         if (folders.Count > 0)
@@ -97,29 +113,34 @@ public class HangfireJobs
                 .Where(x => x.BulkUploadId == bulkUploadId)
                 .Select(x => x.RelativeFolderPath)
                 .ToListAsync();
-            
-            //Create Mirror records
+
+            var existingFolderPaths = new HashSet<string>(
+                existingFolders,
+                StringComparer.OrdinalIgnoreCase);
+
             returnFolders = folders
-                .Select(folder =>
+                .Select(folder => new BulkUploadAutodeskMirror
                 {
-                    return new BulkUploadAutodeskMirror()
-                    {
-                        BulkUploadId = bulkUpload.Id,
-                        FolderName = folder.Name,
-                        FolderUrn = folder.FolderId,
-                        FolderUrl = folder.Url,
-                        RelativeFolderPath = Path.Combine(bulkUploadMirror.RelativeFolderPath, folder.Name),
-                        ContentsRetrieved = false
-                    };
+                    BulkUploadId = bulkUpload.Id,
+                    FolderName = folder.Name,
+                    FolderUrn = folder.FolderId,
+                    FolderUrl = folder.Url,
+                    RelativeFolderPath = Path.Combine(
+                        bulkUploadMirror.RelativeFolderPath,
+                        folder.Name),
+                    ContentsRetrieved = false
                 })
-                .Where(x=>existingFolders.Contains(x.RelativeFolderPath) == false)
+                .Where(x => !existingFolderPaths.Contains(x.RelativeFolderPath))
                 .ToList();
 
-            await _context.BulkUploadAutodeskMirrors.AddRangeAsync(returnFolders);
+            if (returnFolders.Count > 0)
+            {
+                await _context.BulkUploadAutodeskMirrors
+                    .AddRangeAsync(returnFolders);
+            }
         }
 
         bulkUploadMirror.ContentsRetrieved = true;
-        _context.BulkUploadAutodeskMirrors.Update(bulkUploadMirror);
         await _context.SaveChangesAsync();
 
         return returnFolders;
@@ -128,104 +149,129 @@ public class HangfireJobs
     [Queue("build-autodesk-mirror")]
     public async Task BuildAutodeskMirror(int bulkUploadId, int mirrorId)
     {
-        //Get items from database
-        var bulkUploadMirror =
-            await _context.BulkUploadAutodeskMirrors.FirstOrDefaultAsync(x => x.Id == mirrorId);
-        if (bulkUploadMirror == null) return;
-        var bulkUpload = await _context.BulkUploads.FirstOrDefaultAsync(x => x.Id == bulkUploadMirror.BulkUploadId);
-        if (bulkUpload == null) return;
+        var bulkUploadMirror = await _context.BulkUploadAutodeskMirrors
+            .FirstOrDefaultAsync(x => x.Id == mirrorId);
 
-        var newBulkUploadMirrors = await RetrieveNewMirrorFolders(bulkUploadId, mirrorId);
+        if (bulkUploadMirror == null)
+            return;
+
+        var bulkUpload = await _context.BulkUploads
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadMirror.BulkUploadId);
+
+        if (bulkUpload == null)
+            return;
+
+        var newBulkUploadMirrors = await RetrieveNewMirrorFolders(
+            bulkUploadId,
+            mirrorId);
 
         foreach (var mirror in newBulkUploadMirrors)
         {
-            BackgroundJob.Enqueue<HangfireJobs>(x => x.BuildAutodeskMirror(bulkUploadId, mirror.Id));
+            BackgroundJob.Enqueue<HangfireJobs>(
+                x => x.BuildAutodeskMirror(bulkUploadId, mirror.Id));
         }
 
-        //Check if there is are any folders that have not been processed
         var remainingJobsCount = await _context.BulkUploadAutodeskMirrors
             .Where(x => x.BulkUploadId == bulkUploadId)
             .CountAsync(x => x.ContentsRetrieved == false);
 
-        //If all folders have been processed, kick off the folder parsing
-        if (remainingJobsCount == 0)
+        if (remainingJobsCount == 0 && LocalCrawlStarted.TryAdd(bulkUpload.Id, 0))
         {
             bulkUpload.AddLogs("Finished creating Autodesk Cloud Folder Mirror");
-            _context.BulkUploads.Update(bulkUpload);
             await _context.SaveChangesAsync();
 
-            BackgroundJob.Enqueue<HangfireJobs>(x => x.ProcessLocalFolder(
-                bulkUpload.Id,
-                bulkUpload.LocalPath
-            ));
+            BackgroundJob.Enqueue<HangfireJobs>(
+                x => x.ProcessLocalFolder(bulkUpload.Id, bulkUpload.LocalPath));
         }
     }
 
     [Queue("process-local-folder")]
     public async Task ProcessLocalFolder(int bulkUploadId, string folderPath)
     {
-        //Retrieve mirrors and bulkUpload from database, to assist in creating files
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+        {
+            Log.Warning(
+                "Local folder does not exist. Bulk upload ID: {BulkUploadId}, path: {FolderPath}",
+                bulkUploadId,
+                folderPath);
+            return;
+        }
+
         var bulkUpload = await _context.BulkUploads
             .Include(x => x.AutodeskMirrors)
             .FirstOrDefaultAsync(x => x.Id == bulkUploadId);
-        if (bulkUpload == null) return;
 
-        //Retrieve all local folder contents
+        if (bulkUpload == null)
+            return;
+
         var allFolders = Directory.GetDirectories(folderPath).ToList();
         var allFiles = Directory.GetFiles(folderPath).ToList();
 
-
-        //For each folder, run a new 'Process LocalFolder' job
         foreach (var folder in allFolders)
         {
-            BackgroundJob.Enqueue<HangfireJobs>(x => x.ProcessLocalFolder(bulkUploadId, folder));
+            BackgroundJob.Enqueue<HangfireJobs>(
+                x => x.ProcessLocalFolder(bulkUploadId, folder));
         }
 
-        //For each file, run a new 'Process LocalFile' job
-        var bulkUploadFiles = allFiles.Select(filePath => BulkUploadFile.CreateFile(
-            bulkUpload,
-            Path.GetDirectoryName(filePath.Replace(bulkUpload.LocalPath, "")),
-            filePath
-        )).ToList();
-        try
+        var bulkUploadFiles = allFiles
+            .Select(filePath =>
+            {
+                // Store the folder path relative to the selected upload root.
+                // A file directly inside the root has an empty relative folder path.
+                var relativeFilePath = Path.GetRelativePath(
+                    bulkUpload.LocalPath,
+                    filePath);
+
+                var relativeFolderPath =
+                    Path.GetDirectoryName(relativeFilePath) ?? string.Empty;
+
+                return BulkUploadFile.CreateFile(
+                    bulkUpload,
+                    relativeFolderPath,
+                    filePath);
+            })
+            .ToList();
+
+        if (bulkUploadFiles.Count > 0)
         {
             await _context.BulkUploadFiles.AddRangeAsync(bulkUploadFiles);
             await _context.SaveChangesAsync();
-        }catch (Exception ex)
-        {
-            Console.WriteLine(ex.ToString());
         }
-        
-
 
         foreach (var file in bulkUploadFiles)
         {
-            //if (file.Status != JobFileStatus.DoNotUpload && file.Status != JobFileStatus.Failed &&
-            //    file.Status != JobFileStatus.Proposed)
-            if (file.Status != JobFileStatus.DoNotUpload && file.Status != JobFileStatus.Failed)
+            if (bulkUpload.Status == BulkUploadStatus.Preview
+                || file.Status == JobFileStatus.DoNotUpload
+                || file.Status == JobFileStatus.Failed)
             {
-                if (string.IsNullOrWhiteSpace(file.FolderUrn))
-                {
-                    BackgroundJob.Enqueue<HangfireJobs>(x => x.CreateMissingFolder(file.BulkUploadId, file.Id));
-                }
-                else
-                {
-                    BackgroundJob.Enqueue<HangfireJobs>(x => x.ProcessFile(file.BulkUploadId, file.Id));
-                }
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(file.FolderUrn))
+            {
+                BackgroundJob.Enqueue<HangfireJobs>(
+                    x => x.CreateMissingFolder(file.BulkUploadId, file.Id));
+            }
+            else
+            {
+                BackgroundJob.Enqueue<HangfireJobs>(
+                    x => x.ProcessFile(file.BulkUploadId, file.Id));
             }
         }
     }
 
     private List<string> GetAllDirectories(string relativePath)
     {
-        var splitPaths = relativePath.Split("\\").ToList();
-        var directories = new List<string>();
-        var currentFolder = "";
+        var splitPaths = relativePath
+            .Split('\\', StringSplitOptions.RemoveEmptyEntries)
+            .ToList();
 
-        foreach (string path in splitPaths)
+        var directories = new List<string>();
+        var currentFolder = string.Empty;
+
+        foreach (var path in splitPaths)
         {
             currentFolder = Path.Combine(currentFolder, path);
-            if (string.IsNullOrWhiteSpace(currentFolder)) currentFolder = "\\";
             directories.Add(currentFolder);
         }
 
@@ -235,69 +281,89 @@ public class HangfireJobs
     [Queue("create-cloud-folders")]
     public async Task CreateMissingFolder(int bulkUploadId, int bulkUploadFileId)
     {
-        //Retrieve the bulk upload and file
-        var bulkUpload = await _context.BulkUploads.FirstOrDefaultAsync(x => x.Id == bulkUploadId);
-        var bulkUploadFile =
-            await _context.BulkUploadFiles.FirstOrDefaultAsync(x => x.Id == bulkUploadFileId);
+        var bulkUpload = await _context.BulkUploads
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadId);
 
-        if (bulkUpload == null || bulkUploadFile == null || bulkUpload.Id != bulkUploadFile.BulkUploadId)
+        var bulkUploadFile = await _context.BulkUploadFiles
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadFileId);
+
+        if (bulkUpload == null
+            || bulkUploadFile == null
+            || bulkUpload.Id != bulkUploadFile.BulkUploadId)
         {
             return;
         }
 
-
-        //Find the closest parent that exists in the mirror
         var paths = GetAllDirectories(bulkUploadFile.TargetRelativePath);
-        BulkUploadAutodeskMirror lastMirror = null;
+        BulkUploadAutodeskMirror? lastMirror = null;
+
         foreach (var path in paths)
         {
             var matchingMirror = await _context.BulkUploadAutodeskMirrors
-                .FirstOrDefaultAsync(x => x.BulkUploadId == bulkUploadId && x.RelativeFolderPath == path);
+                .FirstOrDefaultAsync(x =>
+                    x.BulkUploadId == bulkUploadId
+                    && x.RelativeFolderPath == path);
 
-            if (matchingMirror == null)
-            {
-                if (lastMirror == null) return;
-                var folderName = path.Split("\\").LastOrDefault() ?? "";
-
-                try
-                {
-                    //Create Folder
-                    var folder = await APSHelpers.CreateFolder(bulkUpload.ProjectId, lastMirror.FolderUrn, folderName);
-                    bulkUploadFile.AddLogs($"Created folder: {path}");
-                    var newMirrorFolder = new BulkUploadAutodeskMirror()
-                    {
-                        BulkUploadId = bulkUploadId,
-                        ContentsRetrieved = true,
-                        FolderName = folder.Data.Attributes.Name,
-                        FolderUrn = folder.Data.Id,
-                        FolderUrl = folder.Links.Self.Href, // Issue with the new SDK: missing -> folder.Links?.WebView?.Href,
-                        RelativeFolderPath = path
-                    };
-
-                    _context.BulkUploadAutodeskMirrors.Add(newMirrorFolder);
-                    await _context.SaveChangesAsync();
-                    lastMirror = newMirrorFolder;
-                }
-                catch (FlurlHttpException e)
-                {
-                    if (e.StatusCode == 409)
-                    {
-                        //TODO: Check APS to see if the folder has been created. If so, add it to the mirror and restart the job
-                        await RetrieveNewMirrorFolders(bulkUploadId, lastMirror.Id);
-                    }
-
-                    throw;
-                }
-            }
-            else
+            if (matchingMirror != null)
             {
                 lastMirror = matchingMirror;
+                continue;
+            }
+
+            if (lastMirror == null)
+            {
+                bulkUploadFile.AddLogs(
+                    $"Could not find an existing parent folder for: {path}");
+                bulkUploadFile.Status = JobFileStatus.Failed;
+                await _context.SaveChangesAsync();
+                return;
+            }
+
+            var folderName = path.Split('\\').LastOrDefault() ?? string.Empty;
+
+            try
+            {
+                var folder = await APSHelpers.CreateFolder(
+                    bulkUpload.ProjectId,
+                    lastMirror.FolderUrn,
+                    folderName);
+
+                var newMirrorFolder = new BulkUploadAutodeskMirror
+                {
+                    BulkUploadId = bulkUploadId,
+                    ContentsRetrieved = true,
+                    FolderName = folder.Data.Attributes.Name,
+                    FolderUrn = folder.Data.Id,
+                    FolderUrl = folder.Links.Self.Href,
+                    RelativeFolderPath = path
+                };
+
+                bulkUploadFile.AddLogs($"Created folder: {path}");
+
+                await _context.BulkUploadAutodeskMirrors.AddAsync(newMirrorFolder);
+                await _context.SaveChangesAsync();
+
+                lastMirror = newMirrorFolder;
+            }
+            catch (FlurlHttpException ex)
+            {
+                if (ex.StatusCode == 409)
+                {
+                    // Refresh the mirror after a conflict, then retry this job.
+                    await RetrieveNewMirrorFolders(bulkUploadId, lastMirror.Id);
+                    throw new InvalidOperationException(
+                        $"Folder already exists in Autodesk Construction Cloud: {path}. Mirror refreshed; retry the job.",
+                        ex);
+                }
+
+                throw;
             }
         }
 
         if (lastMirror == null)
         {
-            bulkUploadFile.AddLogs("Could not find a matching folder in the folder paths");
+            bulkUploadFile.AddLogs(
+                "Could not find a matching folder in the folder paths.");
             bulkUploadFile.Status = JobFileStatus.Failed;
         }
         else
@@ -307,32 +373,41 @@ public class HangfireJobs
             bulkUploadFile.FolderUrl = lastMirror.FolderUrl;
         }
 
-        _context.BulkUploadFiles.Update(bulkUploadFile);
         await _context.SaveChangesAsync();
 
-        //Run processFile if a folder URN has been created
         if (!string.IsNullOrWhiteSpace(bulkUploadFile.FolderUrn))
         {
-            BackgroundJob.Enqueue<HangfireJobs>(x => x.ProcessFile(bulkUploadFile.BulkUploadId, bulkUploadFile.Id));
+            BackgroundJob.Enqueue<HangfireJobs>(
+                x => x.ProcessFile(
+                    bulkUploadFile.BulkUploadId,
+                    bulkUploadFile.Id));
         }
     }
 
     [Queue("process-file")]
-    public async Task CheckForUpdatedFiles(int bulkUploadId, int bulkUploadFileId)
+    public async Task CheckForUpdatedFiles(
+        int bulkUploadId,
+        int bulkUploadFileId)
     {
-        //Retrieve the bulk upload and file
-        var bulkUpload = await _context.BulkUploads.FirstOrDefaultAsync(x => x.Id == bulkUploadId);
-        var bulkUploadFile =
-            await _context.BulkUploadFiles.FirstOrDefaultAsync(x => x.Id == bulkUploadFileId);
+        var bulkUpload = await _context.BulkUploads
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadId);
 
-        if (bulkUpload == null || bulkUploadFile == null || bulkUpload.Id != bulkUploadFile.BulkUploadId) return;
+        var bulkUploadFile = await _context.BulkUploadFiles
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadFileId);
 
-        //Get folder contents, and update file mirrors if necessary
+        if (bulkUpload == null
+            || bulkUploadFile == null
+            || bulkUpload.Id != bulkUploadFile.BulkUploadId)
+        {
+            return;
+        }
+
         var token = await JointTokenManager.GetToken();
-        // var token = await ThreeLeggedMananger.Instance.GetToken();
-        var (folders, files) =
-            await APSHelpers.GetFolderContents(token, bulkUpload.ProjectId, bulkUploadFile.FolderUrn);
 
+        var (folders, files) = await APSHelpers.GetFolderContents(
+            token,
+            bulkUpload.ProjectId,
+            bulkUploadFile.FolderUrn);
 
         var existingFiles = await _context.BulkUploadAutodeskMirrorFiles
             .Where(x => x.BulkUploadId == bulkUploadId)
@@ -340,282 +415,415 @@ public class HangfireJobs
             .Select(x => x.Name)
             .ToListAsync();
 
+        var existingFileNames = new HashSet<string>(
+            existingFiles,
+            StringComparer.OrdinalIgnoreCase);
+
         var newFiles = files
-            .Where(x => !existingFiles.Contains(x.Name))
-            .Select(x => new BulkUploadAutodeskMirrorFile()
+            .Where(x => !existingFileNames.Contains(x.Name))
+            .Select(x => new BulkUploadAutodeskMirrorFile
             {
                 BulkUploadId = bulkUploadId,
                 FolderUrn = bulkUploadFile.FolderUrn,
                 ItemId = x.ItemId,
                 Name = x.Name
-            });
+            })
+            .ToList();
 
-        await _context.BulkUploadAutodeskMirrorFiles.AddRangeAsync(newFiles);
-        await _context.SaveChangesAsync();
+        if (newFiles.Count > 0)
+        {
+            await _context.BulkUploadAutodeskMirrorFiles.AddRangeAsync(newFiles);
+            await _context.SaveChangesAsync();
+        }
 
-        //Process file
-        BackgroundJob.Enqueue<HangfireJobs>(x => x.ProcessFile(bulkUploadId, bulkUploadFileId));
+        BackgroundJob.Enqueue<HangfireJobs>(
+            x => x.ProcessFile(bulkUploadId, bulkUploadFileId));
     }
 
     [Queue("process-file")]
     public async Task ProcessFile(int bulkUploadId, int bulkUploadFileId)
     {
-        var bulkUpload = await _context.BulkUploads.FirstOrDefaultAsync(x => x.Id == bulkUploadId);
-        var bulkUploadFile =
-            await _context.BulkUploadFiles.FirstOrDefaultAsync(x => x.Id == bulkUploadFileId);
+        var bulkUpload = await _context.BulkUploads
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadId);
 
-        if (bulkUpload == null || bulkUploadFile == null || bulkUpload.Id != bulkUploadFile.BulkUploadId)
+        var bulkUploadFile = await _context.BulkUploadFiles
+            .FirstOrDefaultAsync(x => x.Id == bulkUploadFileId);
+
+        if (bulkUpload == null
+            || bulkUploadFile == null
+            || bulkUpload.Id != bulkUploadFile.BulkUploadId)
         {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(bulkUploadFile.FolderUrn))
+        {
+            await UpdateFileStatus(
+                bulkUploadFileId,
+                JobFileStatus.Failed,
+                "Folder not created yet");
             return;
         }
 
         var existingFile = await _context.BulkUploadAutodeskMirrorFiles
             .Where(x => x.BulkUploadId == bulkUploadId)
             .Where(x => x.FolderUrn == bulkUploadFile.FolderUrn)
-            .Where(x => x.Name == bulkUploadFile.TargetFileName.ToLower())
-            .FirstOrDefaultAsync();
+            .FirstOrDefaultAsync(x =>
+                x.Name == bulkUploadFile.TargetFileName.ToLowerInvariant());
 
         if (existingFile != null)
         {
             bulkUploadFile.ItemId = existingFile.ItemId;
-            _context.BulkUploadFiles.Update(bulkUploadFile);
             await _context.SaveChangesAsync();
-        }
-
-        if (string.IsNullOrWhiteSpace(bulkUploadFile.FolderUrn))
-        {
-            await UpdateFileStatus(bulkUploadFileId, JobFileStatus.Failed, "Folder not created yet");
         }
 
         try
         {
-            //Create storage location
-            var storageLocation = await APSHelpers.CreateStorageLocation(bulkUpload.ProjectId, bulkUploadFile.TargetFileName, bulkUpload.FolderId);
-            Regex rg = new Regex("^urn:adsk\\.objects:os\\.object:([-_.a-z0-9]{3,128})\\/(.+)$");
-            var matches = rg.Matches(storageLocation.Data.Id);
-            string bucketKey = matches[0].Groups[1].Value;
-            string objectKey = matches[0].Groups[2].Value;
-            bulkUploadFile.BucketKey = bucketKey;
-            bulkUploadFile.ObjectId = objectKey;
-            _context.BulkUploadFiles.Update(bulkUploadFile);
+            var storageLocation = await APSHelpers.CreateStorageLocation(
+                bulkUpload.ProjectId,
+                bulkUploadFile.TargetFileName,
+                bulkUpload.FolderId);
+
+            var storageObjectId = storageLocation?.Data?.Id;
+
+            if (string.IsNullOrWhiteSpace(storageObjectId))
+            {
+                throw new InvalidOperationException(
+                    "Autodesk returned an empty storage object ID.");
+            }
+
+            var regex = new Regex(
+                "^urn:adsk\\.objects:os\\.object:([-_.a-z0-9]{3,128})\\/(.+)$",
+                RegexOptions.IgnoreCase);
+
+            var match = regex.Match(storageObjectId);
+
+            if (!match.Success)
+            {
+                throw new InvalidOperationException(
+                    $"The storage object ID has an unexpected format: {storageObjectId}");
+            }
+
+            bulkUploadFile.BucketKey = match.Groups[1].Value;
+            bulkUploadFile.ObjectId = match.Groups[2].Value;
+
             await _context.SaveChangesAsync();
 
-            // Upload file to storage location
-            long UPLOAD_CHUNK_SIZE = 20 * 1024 * 1024;
-            FileStream fileStream = new FileStream(bulkUploadFile.SourceAbsolutePath, FileMode.Open,
-                FileAccess.Read);
-            long fileSize = fileStream.Length;
-            int numberOfChunks = (int) Math.Round((double) (fileSize / UPLOAD_CHUNK_SIZE)) + 1;
+            var fileInfo = new FileInfo(bulkUploadFile.SourceAbsolutePath);
+
+            if (!fileInfo.Exists)
+            {
+                throw new FileNotFoundException(
+                    "The source file could not be found.",
+                    bulkUploadFile.SourceAbsolutePath);
+            }
+
+            var fileSize = fileInfo.Length;
+            var numberOfChunks = fileSize == 0
+                ? 1
+                : (int)Math.Ceiling((double)fileSize / UploadChunkSize);
+
             long partsUploaded = 0;
             long start = 0;
+            var uploadUrls = new List<string>();
+            string? uploadKey = null;
 
-            List<string> uploadUrls = new List<string>();
-            string uploadKey = null;
-            int maxBatches = 25;
+            Log.Information(
+                "Starting upload of {FilePath}. Size: {FileSize}. Chunks: {ChunkCount}",
+                bulkUploadFile.SourceAbsolutePath,
+                fileSize,
+                numberOfChunks);
 
-            Console.WriteLine($"Number of file chunks to upload: {numberOfChunks}");
-
-            using (BinaryReader reader = new BinaryReader(fileStream))
+            using (var fileStream = new FileStream(
+                bulkUploadFile.SourceAbsolutePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read))
+            using (var reader = new BinaryReader(fileStream))
             {
                 while (partsUploaded < numberOfChunks)
                 {
-                    int attempts = 0;
+                    var end = Math.Min(
+                        (partsUploaded + 1) * UploadChunkSize,
+                        fileSize);
 
-                    long chunkWithParts = (long) ((partsUploaded + 1) * UPLOAD_CHUNK_SIZE);
-                    long end = Math.Min(chunkWithParts, fileSize);
+                    var numberOfBytes = checked((int)(end - start));
+                    var fileBytes = new byte[numberOfBytes];
 
-                    int numberOfBytes = (int) (end - start);
-
-                    byte[] fileBytes = new byte[numberOfBytes];
                     reader.BaseStream.Seek(start, SeekOrigin.Begin);
-                    int count = reader.Read(fileBytes, 0, numberOfBytes);
 
-                    while (true)
+                    var bytesRead = 0;
+                    while (bytesRead < numberOfBytes)
                     {
-                        attempts++;
-                        if (uploadUrls.Count == 0)
-                        {
-                            //var token = await TokenManager.GetTwoLeggedToken();
-                            var part = Math.Min(numberOfChunks - partsUploaded, maxBatches);
-                            int partInt = Convert.ToInt32(part);
+                        var read = reader.Read(
+                            fileBytes,
+                            bytesRead,
+                            numberOfBytes - bytesRead);
 
-                            int partsUploadInt = Convert.ToInt32(partsUploaded) + 1;
-                            var uploadParams = await APSHelpers.GetUploadUrls(bulkUploadFile.BucketKey, bulkUploadFile.ObjectId, 60, partInt, partsUploadInt, uploadKey);
-                            uploadKey = uploadParams.UploadKey;
-                            uploadUrls = uploadParams.Urls;
+                        if (read == 0)
+                        {
+                            throw new EndOfStreamException(
+                                "Unexpected end of file while reading an upload chunk.");
                         }
 
-                        string currentUrl = uploadUrls[0];
+                        bytesRead += read;
+                    }
+
+                    var chunkUploaded = false;
+                    var attempts = 0;
+
+                    while (!chunkUploaded && attempts < MaxUploadAttempts)
+                    {
+                        attempts++;
+
+                        if (uploadUrls.Count == 0)
+                        {
+                            var remainingParts = numberOfChunks - partsUploaded;
+                            var requestedParts = (int)Math.Min(
+                                remainingParts,
+                                MaxUploadUrlBatchSize);
+
+                            var firstPartNumber = checked((int)partsUploaded + 1);
+
+                            var uploadParams = await APSHelpers.GetUploadUrls(
+                                bulkUploadFile.BucketKey,
+                                bulkUploadFile.ObjectId,
+                                60,
+                                requestedParts,
+                                firstPartNumber,
+                                uploadKey!);
+
+                            uploadKey = uploadParams.UploadKey;
+                            uploadUrls = uploadParams.Urls ?? new List<string>();
+
+                            if (uploadUrls.Count == 0)
+                            {
+                                throw new InvalidOperationException(
+                                    "Autodesk did not return any upload URLs.");
+                            }
+                        }
+
+                        var currentUrl = uploadUrls[0];
                         uploadUrls.RemoveAt(0);
 
                         try
                         {
-                            var responseBuffer = await UploadBufferRestSharp(currentUrl, fileBytes);
+                            var response = await UploadBufferRestSharp(
+                                currentUrl,
+                                fileBytes);
 
-                            int statusCode = (int) responseBuffer.StatusCode;
+                            var statusCode = (int)response.StatusCode;
 
-                            switch (statusCode)
+                            if (statusCode >= 200 && statusCode < 300)
                             {
-                                case 403:
-                                    //Console.WriteLine("403, refreshing urls");
-                                    uploadUrls = new List<string>();
-                                    break;
-                                case 503:
-                                    break;
-                                case int n when (n >= 400 && n != 503):
-                                    throw new Exception(responseBuffer.Content);
-                                default:
-                                    goto NextChunk;
+                                chunkUploaded = true;
+                                continue;
+                            }
+
+                            if (statusCode == 403)
+                            {
+                                // The signed URL may have expired. Request fresh URLs.
+                                uploadUrls.Clear();
+                            }
+                            else if (statusCode == 503 || statusCode == 429)
+                            {
+                                await Task.Delay(
+                                    TimeSpan.FromSeconds(Math.Min(
+                                        Math.Pow(2, attempts),
+                                        30)));
+                            }
+                            else
+                            {
+                                throw new HttpRequestException(
+                                    $"Chunk upload failed with HTTP {statusCode}: {response.Content}");
                             }
                         }
-                        catch (Exception ex)
+                        catch (Exception ex) when (
+                            attempts < MaxUploadAttempts
+                            && ex is not OperationCanceledException)
                         {
-                            Console.WriteLine("Problem with chunking upload");
-                            Console.WriteLine(ex.Message);
-                            Log.Error("Problem with chunking upload");
-                            Log.Error(ex.Message);
-                            if (attempts == 5)
-                                throw;
+                            Log.Warning(
+                                ex,
+                                "Upload chunk attempt {Attempt}/{MaxAttempts} failed for {FilePath}",
+                                attempts,
+                                MaxUploadAttempts,
+                                bulkUploadFile.SourceAbsolutePath);
+
+                            await Task.Delay(
+                                TimeSpan.FromSeconds(Math.Min(
+                                    Math.Pow(2, attempts),
+                                    30)));
                         }
                     }
 
-                    NextChunk:
+                    if (!chunkUploaded)
+                    {
+                        throw new InvalidOperationException(
+                            $"Upload chunk {partsUploaded + 1} failed after {MaxUploadAttempts} attempts.");
+                    }
+
                     partsUploaded++;
-                    Console.WriteLine(
-                        $"{partsUploaded.ToString()} of {numberOfChunks.ToString()} parts uploaded for {bulkUploadFile.SourceAbsolutePath} ");
                     start = end;
+
+                    UploadProgress.Set(
+                        bulkUploadId,
+                        bulkUploadFileId,
+                        end);
+
+                    Log.Information(
+                        "Uploaded chunk {CurrentChunk}/{TotalChunks} for {FilePath}",
+                        partsUploaded,
+                        numberOfChunks,
+                        bulkUploadFile.SourceAbsolutePath);
                 }
             }
 
-            _ = await APSHelpers.CompleteUpload(bulkUploadFile.BucketKey, bulkUploadFile.ObjectId, uploadKey);
+            if (string.IsNullOrWhiteSpace(uploadKey))
+            {
+                throw new InvalidOperationException(
+                    "Autodesk did not return an upload key; the upload cannot be completed.");
+            }
 
-            //Create Version or Update Version
+            await APSHelpers.CompleteUpload(
+                bulkUploadFile.BucketKey,
+                bulkUploadFile.ObjectId,
+                uploadKey);
+
             if (string.IsNullOrWhiteSpace(bulkUploadFile.ItemId))
             {
                 try
                 {
-                    var version = await APSHelpers.CreateFirstVersion(bulkUpload.ProjectId,
-                        bulkUploadFile.TargetFileName, bulkUploadFile.FolderUrn, bulkUploadFile.BucketKey, bulkUploadFile.ObjectId);
+                    var version = await APSHelpers.CreateFirstVersion(
+                        bulkUpload.ProjectId,
+                        bulkUploadFile.TargetFileName,
+                        bulkUploadFile.FolderUrn,
+                        bulkUploadFile.BucketKey,
+                        bulkUploadFile.ObjectId);
+
                     bulkUploadFile.VersionId = version.Data.Id;
-                    bulkUploadFile.WebUrl = version.Links.Self.Href;  // Issue with the new SDK: missing -> version.Link.WebView.Href
+                    bulkUploadFile.WebUrl = version.Links.Self.Href;
                 }
-                catch (FlurlHttpException e)
+                catch (FlurlHttpException ex) when (ex.StatusCode == 409)
                 {
-                    if (e.StatusCode == 409)
-                    {
-                        BackgroundJob.Enqueue<HangfireJobs>(x =>
-                            x.CheckForUpdatedFiles(bulkUploadId, bulkUploadFileId));
-                        return;
-                    }
-                    else
-                    {
-                        throw;
-                    }
+                    BackgroundJob.Enqueue<HangfireJobs>(
+                        x => x.CheckForUpdatedFiles(
+                            bulkUploadId,
+                            bulkUploadFileId));
+                    return;
                 }
             }
             else
             {
-                var version = await APSHelpers.CreateNextVersion(bulkUpload.ProjectId, bulkUploadFile.TargetFileName,
-                    bulkUploadFile.ItemId, bulkUploadFile.BucketKey, bulkUploadFile.ObjectId);
+                var version = await APSHelpers.CreateNextVersion(
+                    bulkUpload.ProjectId,
+                    bulkUploadFile.TargetFileName,
+                    bulkUploadFile.ItemId,
+                    bulkUploadFile.BucketKey,
+                    bulkUploadFile.ObjectId);
+
                 bulkUploadFile.VersionId = version.Data.Id;
-                bulkUploadFile.WebUrl = version.Links.Self.Href;  // Issue with the new SDK: missing -> version.Link.WebView.Href
+                bulkUploadFile.WebUrl = version.Links.Self.Href;
             }
 
-            _context.BulkUploadFiles.Update(bulkUploadFile);
             await _context.SaveChangesAsync();
 
-            await UpdateFileStatus(bulkUploadFileId, JobFileStatus.Success);
-
-            //TODO: Build an event queue to pass messages to the UI and refresh any currently active views
+            await UpdateFileStatus(
+                bulkUploadFileId,
+                JobFileStatus.Success);
         }
-        catch (Exception e)
+        catch (Exception ex)
         {
-            await UpdateFileStatus(bulkUploadFileId, JobFileStatus.Failed, e.Message);
-            Log.Error("Problem uploading file: " + bulkUploadFile.SourceAbsolutePath);
-            Log.Error("Reason: " + e.Message);
-            Log.Information("Stack: " + e.StackTrace);
+            await UpdateFileStatus(
+                bulkUploadFileId,
+                JobFileStatus.Failed,
+                ex.Message);
+
+            Log.Error(
+                ex,
+                "Problem uploading file: {FilePath}",
+                bulkUploadFile.SourceAbsolutePath);
+
             throw;
+        }
+        finally
+        {
+            UploadProgress.Remove(bulkUploadFileId);
         }
     }
 
     [Queue("kill-finished")]
     public async Task KillOnceFinished(int dbJobId)
     {
-        Task.Delay(2000);
-        var api = JobStorage.Current.GetMonitoringApi(); // Determine if we are the last job standing
+        await Task.Delay(2000);
+
+        var api = JobStorage.Current.GetMonitoringApi();
+
         while (api.ProcessingCount() > 1)
         {
-            Task.Delay(500);
+            await Task.Delay(500);
         }
 
         Log.Information("File Upload Process Completed");
-        // var _context = new DataContextFactory().CreateDbContext();
+
         var job = await _context.BulkUploads.FindAsync(dbJobId);
+
         if (job == null)
             return;
-        job.EndTime = DateTime.Now;
-        _context.SaveChanges();
-        //Process.Start(SerilogFileResults.LogFilePath);
 
-        //Environment.Exit(0);
+        job.EndTime = DateTime.Now;
+        await _context.SaveChangesAsync();
     }
 
     /// <summary>
-    /// Upload the specific part through url
+    /// Uploads a single chunk to the supplied signed URL.
     /// </summary>
-    /// <param name="url">URL to upload the specified part</param>
-    /// <param name="buffer">Buffer array to upload</param>
-    public static async Task<dynamic> UploadBufferRestSharp(string url, byte[] buffer)
+    /// <param name="url">Signed URL for the upload chunk.</param>
+    /// <param name="buffer">Chunk contents.</param>
+    public static async Task<RestResponse> UploadBufferRestSharp(
+        string url,
+        byte[] buffer)
     {
-        RestResponse response = null;
+        using var client = new RestClient();
+        var request = new RestRequest(url, Method.Put);
 
-        try
-        {
-            RestClient client = new RestClient();
-            RestRequest request = new RestRequest(url, RestSharp.Method.Put);
-            //request.AddParameter("", buffer, ParameterType.RequestBody);
-            request.AddParameter("application/octet-stream", buffer, ParameterType.RequestBody);
+        request.AddParameter(
+            "application/octet-stream",
+            buffer,
+            ParameterType.RequestBody);
 
-            response = await client.ExecuteAsync(request);
-        }
-        catch (Exception e)
-        {
-        }
-
-        // See if we are getting a "Slow Down" message aka 503 Service Unavailable
-
-        if (response != null)
-        {
-            if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
-            {
-                Task.Delay(5000);
-                UploadBufferRestSharp(url, buffer);
-            }
-        }
-
-        return response;
+        // Do not swallow exceptions or recursively retry here.
+        // ProcessFile owns the bounded retry policy.
+        return await client.ExecuteAsync(request);
     }
 
-    public async Task UpdateFileStatus(int dbFileId, JobFileStatus status, string notes = "")
+    public async Task UpdateFileStatus(
+        int dbFileId,
+        JobFileStatus status,
+        string notes = "")
     {
         try
         {
             var dbFile = await _context.BulkUploadFiles.FindAsync(dbFileId);
+
             if (dbFile == null)
                 return;
+
             dbFile.Status = status;
             dbFile.LastModified = DateTime.Now;
-            if (!string.IsNullOrWhiteSpace(notes)) dbFile.AddLogs(notes);
+
+            if (!string.IsNullOrWhiteSpace(notes))
+            {
+                dbFile.AddLogs(notes);
+            }
+
             await _context.SaveChangesAsync();
         }
-        catch (Exception e)
+        catch (Exception ex)
         {
-            Console.WriteLine($"Problem updating file status in db for file ID : {dbFileId}");
-            Log.Error("Reason: " + e.Message);
-            Log.Information("Stack: " + e.StackTrace);
-
-            Console.WriteLine("Reason: " + e.Message);
-            Console.WriteLine("stack: " + e.StackTrace);
+            Log.Error(
+                ex,
+                "Problem updating file status in database for file ID {FileId}",
+                dbFileId);
         }
     }
 }
