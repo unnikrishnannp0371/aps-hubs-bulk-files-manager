@@ -520,7 +520,7 @@ namespace Bulk_Uploader_Electron.Utilities
             if (apsS3UploadUrl.HttpResponse.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
             {
                 _ = int.TryParse(apsS3UploadUrl.HttpResponse.Headers.GetValues("Retry-After").FirstOrDefault(), out int retryAfter);
-                await Task.Delay(retryAfter);
+                await Task.Delay(Math.Max(retryAfter, 1) * 1000);
                 return await GetUploadUrls(bucketKey, objectKey, minutesExpiration, parts, firstPart, uploadKey);
             }
             else
